@@ -9,11 +9,12 @@ export type Todo = {
 
 export type TodoRecord = {
   todos: Array<Todo>
-  updatedAt: number
 }
 
 export const TODO_STATUSES: ReadonlyArray<TodoStatus> = ["pending", "in_progress", "completed", "cancelled"]
 export const TODO_PRIORITIES: ReadonlyArray<TodoPriority> = ["high", "medium", "low"]
+export const MAX_TODOS = 100
+export const MAX_CONTENT_LENGTH = 2000
 
 export const STORAGE_PREFIX = "todos/"
 
@@ -28,6 +29,36 @@ export function storageKey(sessionID: string): string {
   return `${STORAGE_PREFIX}${sessionID}`
 }
 
+export function sessionIDFromKey(key: string): string | undefined {
+  if (!key.startsWith(STORAGE_PREFIX)) return undefined
+  return key.slice(STORAGE_PREFIX.length)
+}
+
+function validateTodoItem(entry: unknown, index: number): Todo {
+  if (entry === null || typeof entry !== "object") {
+    throw new Error(`todo #${index + 1} must be an object`)
+  }
+  const item = entry as { content?: unknown; status?: unknown; priority?: unknown }
+  const content = typeof item.content === "string" ? item.content.trim() : ""
+  if (!content) {
+    throw new Error(`todo #${index + 1} requires a non-empty \`content\` string`)
+  }
+  if (content.length > MAX_CONTENT_LENGTH) {
+    throw new Error(`todo #${index + 1} exceeds the maximum content length of ${MAX_CONTENT_LENGTH} characters`)
+  }
+  if (!TODO_STATUSES.includes(item.status as TodoStatus)) {
+    throw new Error(`todo #${index + 1} has invalid \`status\` (expected one of: ${TODO_STATUSES.join(", ")})`)
+  }
+  const todo: Todo = { content, status: item.status as TodoStatus }
+  if (item.priority !== undefined) {
+    if (!TODO_PRIORITIES.includes(item.priority as TodoPriority)) {
+      throw new Error(`todo #${index + 1} has invalid \`priority\` (expected one of: ${TODO_PRIORITIES.join(", ")})`)
+    }
+    todo.priority = item.priority as TodoPriority
+  }
+  return todo
+}
+
 /**
  * Validates a `todowrite` payload. Throws a descriptive error on malformed
  * input so the model can correct itself.
@@ -40,27 +71,10 @@ export function normalizeTodos(input: unknown): Array<Todo> {
   if (!Array.isArray(todos)) {
     throw new Error("`todos` must be an array")
   }
-  return todos.map((entry, index) => {
-    if (entry === null || typeof entry !== "object") {
-      throw new Error(`todo #${index + 1} must be an object`)
-    }
-    const item = entry as { content?: unknown; status?: unknown; priority?: unknown }
-    const content = typeof item.content === "string" ? item.content.trim() : ""
-    if (!content) {
-      throw new Error(`todo #${index + 1} requires a non-empty \`content\` string`)
-    }
-    if (!TODO_STATUSES.includes(item.status as TodoStatus)) {
-      throw new Error(`todo #${index + 1} has invalid \`status\` (expected one of: ${TODO_STATUSES.join(", ")})`)
-    }
-    const todo: Todo = { content, status: item.status as TodoStatus }
-    if (item.priority !== undefined) {
-      if (!TODO_PRIORITIES.includes(item.priority as TodoPriority)) {
-        throw new Error(`todo #${index + 1} has invalid \`priority\` (expected one of: ${TODO_PRIORITIES.join(", ")})`)
-      }
-      todo.priority = item.priority as TodoPriority
-    }
-    return todo
-  })
+  if (todos.length > MAX_TODOS) {
+    throw new Error(`todo list exceeds the maximum of ${MAX_TODOS} items`)
+  }
+  return todos.map((entry, index) => validateTodoItem(entry, index))
 }
 
 /** Renders a todo list as plain text for tool output and context injection. */
@@ -79,7 +93,7 @@ export function renderTodos(todos: Array<Todo>): string {
 /** Reads a stored record defensively; returns undefined when the value is unusable. */
 export function parseTodoRecord(value: unknown): TodoRecord | undefined {
   if (value === null || typeof value !== "object") return undefined
-  const stored = value as { todos?: unknown; updatedAt?: unknown }
+  const stored = value as { todos?: unknown }
   if (!Array.isArray(stored.todos)) return undefined
   const todos: Array<Todo> = []
   for (const entry of stored.todos) {
@@ -92,7 +106,7 @@ export function parseTodoRecord(value: unknown): TodoRecord | undefined {
     }
     todos.push(todo)
   }
-  return { todos, updatedAt: typeof stored.updatedAt === "number" ? stored.updatedAt : 0 }
+  return { todos }
 }
 
 export function hasOpenTodos(todos: Array<Todo>): boolean {

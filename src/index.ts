@@ -1,10 +1,15 @@
 import type { Plugin } from "@opencode/plugin"
 import {
+  MAX_CONTENT_LENGTH,
+  MAX_TODOS,
+  STORAGE_PREFIX,
   TODO_PRIORITIES,
   TODO_STATUSES,
+  hasOpenTodos,
   normalizeTodos,
   parseTodoRecord,
   renderTodos,
+  sessionIDFromKey,
   storageKey,
 } from "./todos.js"
 
@@ -55,6 +60,7 @@ const TODOWRITE_DESCRIPTION = [
   "Use it to plan multi-step work and keep status current: keep exactly one task in_progress while working on it,",
   "mark tasks completed as soon as they are done, and cancel tasks that are no longer needed.",
   "Prefer short, imperative task descriptions.",
+  `Maximum ${MAX_TODOS} items, ${MAX_CONTENT_LENGTH} characters per description.`,
 ].join(" ")
 
 const TODOREAD_DESCRIPTION =
@@ -72,7 +78,7 @@ const plugin: Plugin.Plugin = {
         options: { codemode: false },
         execute: async (input, context) => {
           const todos = normalizeTodos(input)
-          await ctx.storage.set(storageKey(context.sessionID), { todos, updatedAt: Date.now() })
+          await ctx.storage.set(storageKey(context.sessionID), { todos })
           return {
             content: `Todo list updated (${todos.length} ${todos.length === 1 ? "item" : "items"}):\n${renderTodos(todos)}`,
           }
@@ -95,7 +101,7 @@ const plugin: Plugin.Plugin = {
     const context = await ctx.session.hook("context", async (event) => {
       const record = parseTodoRecord(await ctx.storage.get(storageKey(event.sessionID)))
       const todos = record?.todos ?? []
-      if (!todos.some((todo) => todo.status === "pending" || todo.status === "in_progress")) return
+      if (!hasOpenTodos(todos)) return
       event.system.push({
         type: "text",
         text: [
@@ -107,7 +113,49 @@ const plugin: Plugin.Plugin = {
       })
     })
 
+    try {
+      let cursor: string | undefined
+      do {
+        const page = await ctx.storage.scan({ prefix: STORAGE_PREFIX, after: cursor, limit: 100 })
+        for (const entry of page.entries) {
+          const sessionID = sessionIDFromKey(entry.key)
+          if (!sessionID) continue
+          try {
+            if (await ctx.session.get({ sessionID })) continue
+          } catch {
+            // the session is gone; fall through to removal
+          }
+          try {
+            await ctx.storage.remove(entry.key)
+          } catch (error) {
+            console.warn("todolist: failed to remove stale todos", error)
+          }
+        }
+        cursor = page.next
+      } while (cursor)
+    } catch (error) {
+      console.warn("todolist: startup todo sweep failed", error)
+    }
+
+    const controller = new AbortController()
+    const events = ctx.event.subscribe({ signal: controller.signal })
+    const listener = (async () => {
+      for await (const event of events) {
+        if (controller.signal.aborted) break
+        if (event?.type !== "session.deleted") continue
+        const sessionID = event.durable?.aggregateID
+        if (typeof sessionID !== "string") continue
+        try {
+          await ctx.storage.remove(storageKey(sessionID))
+        } catch (error) {
+          console.warn("todolist: failed to remove todos for deleted session", error)
+        }
+      }
+    })()
+
     return async () => {
+      controller.abort()
+      await listener
       await context.dispose()
       await tools.dispose()
     }

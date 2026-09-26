@@ -1,6 +1,6 @@
 {
   "name": "opencode-todolist",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "OpenCode V2 plugin restoring session todo list tools (todowrite/todoread) with a sidebar todo strip",
   "type": "module",
   "exports": {
