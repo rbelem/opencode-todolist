@@ -113,45 +113,62 @@ const plugin: Plugin.Plugin = {
       })
     })
 
-    try {
-      let cursor: string | undefined
-      do {
-        const page = await ctx.storage.scan({ prefix: STORAGE_PREFIX, after: cursor, limit: 100 })
-        for (const entry of page.entries) {
-          const sessionID = sessionIDFromKey(entry.key)
-          if (!sessionID) continue
+    const controller = new AbortController()
+    const events = ctx.event.subscribe({ signal: controller.signal })
+    const listener = (async () => {
+      try {
+        for await (const event of events) {
+          if (controller.signal.aborted) break
+          if (event?.type !== "session.deleted") continue
+          const sessionID = event.data?.sessionID ?? event.durable?.aggregateID
+          if (typeof sessionID !== "string") continue
           try {
-            if (await ctx.session.get({ sessionID })) continue
-          } catch {
-            // the session is gone; fall through to removal
-          }
-          try {
-            await ctx.storage.remove(entry.key)
+            await ctx.storage.remove(storageKey(sessionID))
           } catch (error) {
-            console.warn("todolist: failed to remove stale todos", error)
+            console.warn("todolist: failed to remove todos for deleted session", error)
           }
         }
+        if (!controller.signal.aborted) console.warn("todolist: event stream ended")
+      } catch (error) {
+        // Abort resolves pending next() with done, so a rejection here is always
+        // a real failure. Swallow it so teardown always reaches the disposes.
+        if (!controller.signal.aborted) console.warn("todolist: event subscription ended", error)
+      }
+    })()
+
+    try {
+      let cursor: string | undefined
+      let previous: string | undefined
+      do {
+        const page = await ctx.storage.scan({ prefix: STORAGE_PREFIX, after: cursor, limit: 100 })
+        await Promise.all(
+          page.entries.map(async (entry) => {
+            const sessionID = sessionIDFromKey(entry.key)
+            if (!sessionID) return
+            let alive: boolean
+            try {
+              alive = Boolean(await ctx.session.get({ sessionID }))
+            } catch (error) {
+              // Lookup failure keeps the record; the sweep is self-healing across
+              // restarts via live GC and the next startup sweep.
+              console.warn("todolist: session lookup failed for", entry.key, error)
+              return
+            }
+            if (alive) return
+            try {
+              await ctx.storage.remove(entry.key)
+            } catch (error) {
+              console.warn("todolist: failed to remove stale todos", error)
+            }
+          }),
+        )
+        previous = cursor
         cursor = page.next
+        if (cursor !== undefined && cursor === previous) break
       } while (cursor)
     } catch (error) {
       console.warn("todolist: startup todo sweep failed", error)
     }
-
-    const controller = new AbortController()
-    const events = ctx.event.subscribe({ signal: controller.signal })
-    const listener = (async () => {
-      for await (const event of events) {
-        if (controller.signal.aborted) break
-        if (event?.type !== "session.deleted") continue
-        const sessionID = event.durable?.aggregateID
-        if (typeof sessionID !== "string") continue
-        try {
-          await ctx.storage.remove(storageKey(sessionID))
-        } catch (error) {
-          console.warn("todolist: failed to remove todos for deleted session", error)
-        }
-      }
-    })()
 
     return async () => {
       controller.abort()

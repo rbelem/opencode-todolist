@@ -10,7 +10,7 @@ type ToolDef = {
 
 type ContextHook = (event: { sessionID: string; system: Array<{ type: string; text: string }> }) => Promise<void> | void
 
-type FakeEvent = { type: string; durable?: { aggregateID: string } }
+type FakeEvent = { type: string; data?: { sessionID: string }; durable?: { aggregateID: string } }
 
 async function waitFor(condition: () => boolean, timeoutMs = 1000): Promise<void> {
   const deadline = Date.now() + timeoutMs
@@ -25,7 +25,10 @@ function fakeContext() {
   const hooks = new Map<string, ContextHook>()
   const storage = new Map<string, unknown>()
   const sessions = new Set<string>()
+  const failingLookups = new Set<string>()
   const events: FakeEvent[] = []
+  const disposals = { tools: 0, context: 0 }
+  let streamShouldThrow = false
   let notify: (() => void) | undefined
 
   const editor = {
@@ -41,16 +44,17 @@ function fakeContext() {
     tool: {
       transform: async (callback: (value: unknown) => void) => {
         callback(editor)
-        return { dispose: async () => {} }
+        return { dispose: async () => { disposals.tools++ } }
       },
     },
     session: {
       hook: async (name: string, callback: ContextHook) => {
         hooks.set(name, callback)
-        return { dispose: async () => {} }
+        return { dispose: async () => { disposals.context++ } }
       },
       get: async (input: { sessionID: string }) => {
-        if (!sessions.has(input.sessionID)) throw new Error(`session ${input.sessionID} not found`)
+        if (failingLookups.has(input.sessionID)) throw new Error(`session ${input.sessionID} lookup failed`)
+        if (!sessions.has(input.sessionID)) return undefined
         return { id: input.sessionID }
       },
     },
@@ -58,6 +62,7 @@ function fakeContext() {
       subscribe: async function* (options?: { signal?: AbortSignal }) {
         const signal = options?.signal
         while (!signal?.aborted) {
+          if (streamShouldThrow) throw new Error("event stream failed")
           const event = events.shift()
           if (event) {
             yield event
@@ -97,8 +102,15 @@ function fakeContext() {
     hooks,
     storage,
     sessions,
+    disposals,
     emit: (event: FakeEvent) => {
       events.push(event)
+      notify?.()
+      notify = undefined
+    },
+    failLookup: (sessionID: string) => failingLookups.add(sessionID),
+    failEventStream: () => {
+      streamShouldThrow = true
       notify?.()
       notify = undefined
     },
@@ -177,6 +189,89 @@ test("startup sweep removes todos for dead sessions", async () => {
   assert.ok(fake.storage.has("todos/ses_live"))
   assert.ok(!fake.storage.has("todos/ses_dead"))
   assert.ok(fake.storage.has("todos/"))
+})
+
+test("startup sweep keeps records when session lookup fails", async () => {
+  const fake = fakeContext()
+  fake.storage.set("todos/ses_broken", { todos: [{ content: "Broken", status: "pending" }] })
+  fake.sessions.add("ses_broken")
+  fake.failLookup("ses_broken")
+
+  const warnings: unknown[][] = []
+  const originalWarn = console.warn
+  console.warn = (...args: unknown[]) => {
+    warnings.push(args)
+  }
+  try {
+    await plugin.setup(fake.context)
+  } finally {
+    console.warn = originalWarn
+  }
+
+  assert.ok(fake.storage.has("todos/ses_broken"))
+  assert.ok(warnings.some((args) => args[0] === "todolist: session lookup failed for"))
+})
+
+test("startup sweep removes stale todos across multiple pages", async () => {
+  const fake = fakeContext()
+  const pad = (i: number) => String(i).padStart(3, "0")
+  for (let i = 0; i < 120; i++) {
+    fake.storage.set(`todos/ses_stale_${pad(i)}`, { todos: [{ content: `Stale ${i}`, status: "completed" }] })
+  }
+  for (let i = 0; i < 30; i++) {
+    fake.storage.set(`todos/ses_live_${pad(i)}`, { todos: [{ content: `Live ${i}`, status: "pending" }] })
+    fake.sessions.add(`ses_live_${pad(i)}`)
+  }
+
+  await plugin.setup(fake.context)
+
+  const staleLeft = [...fake.storage.keys()].filter((key) => key.startsWith("todos/ses_stale_"))
+  const liveLeft = [...fake.storage.keys()].filter((key) => key.startsWith("todos/ses_live_"))
+  assert.equal(staleLeft.length, 0)
+  assert.equal(liveLeft.length, 30)
+})
+
+test("event stream failure warns and teardown still disposes", async () => {
+  const fake = fakeContext()
+  const teardown = await plugin.setup(fake.context)
+
+  const warnings: unknown[][] = []
+  const originalWarn = console.warn
+  console.warn = (...args: unknown[]) => {
+    warnings.push(args)
+  }
+  const unhandled: unknown[] = []
+  const onUnhandled = (reason: unknown) => {
+    unhandled.push(reason)
+  }
+  process.on("unhandledRejection", onUnhandled)
+  try {
+    fake.failEventStream()
+    await waitFor(() => warnings.some((args) => args[0] === "todolist: event subscription ended"))
+    if (typeof teardown === "function") await teardown()
+    // Give any unhandled rejection a chance to surface before asserting.
+    await new Promise((resolve) => setImmediate(resolve))
+  } finally {
+    console.warn = originalWarn
+    process.off("unhandledRejection", onUnhandled)
+  }
+
+  assert.equal(fake.disposals.context, 1)
+  assert.equal(fake.disposals.tools, 1)
+  assert.equal(unhandled.length, 0)
+})
+
+test("session.deleted honors event.data.sessionID", async () => {
+  const fake = fakeContext()
+  await plugin.setup(fake.context)
+  await fake.tools.get("todowrite")!.execute(
+    { todos: [{ content: "Task", status: "pending" }] },
+    { sessionID: "ses_2" },
+  )
+  assert.ok(fake.storage.has("todos/ses_2"))
+
+  fake.emit({ type: "session.deleted", data: { sessionID: "ses_2" } })
+  await waitFor(() => !fake.storage.has("todos/ses_2"))
 })
 
 test("session.deleted events remove stored todos", async () => {

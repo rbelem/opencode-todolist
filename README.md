@@ -48,6 +48,8 @@ Example output:
 
 `todowrite` always receives the complete list and replaces the previous one. Passing `{"todos": []}` clears it.
 
+The tool accepts at most 100 items with 2000 characters per description; `todowrite` rejects oversized input with a numbered error so the model can correct itself. Stale records for sessions that no longer exist are swept at plugin startup and removed as `session.deleted` events arrive. If a session lookup fails during the startup sweep, the record is kept and the sweep self-heals on the next restart.
+
 ## Sidebar
 
 The terminal client shows a live todo strip at the end of the session sidebar, styled like the V1 sidebar todo list:
